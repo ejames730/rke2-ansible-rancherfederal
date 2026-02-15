@@ -115,8 +115,8 @@ ansible_user: cloud-user
 ansible_private_key_file: ~/.ssh/id_proxmox
 ansible_become: true
 ansible_become_method: sudo
-cluster_rke2_config:
-  selinux: true
+rke2_install_version: v1.34.3+rke2r3
+cluster_rke2_config: {}
 EOF
 ```
 
@@ -124,8 +124,8 @@ EOF
 - `ansible_user`: SSH user for remote nodes
 - `ansible_private_key_file`: Path to your SSH private key
 - `ansible_become`: Enable privilege escalation (sudo)
-- `cluster_rke2_config`: RKE2-specific configuration applied to all nodes
-  - `selinux: true`: Enables SELinux support (recommended for Rocky)
+- `rke2_install_version`: Pin a specific RKE2 version to avoid internet timeouts when fetching the latest version
+- `cluster_rke2_config`: RKE2-specific configuration applied to all nodes (empty dict for basic setup)
 
 ### group_vars/rke2_servers.yml
 
@@ -167,10 +167,11 @@ This should show all 5 nodes organized under `rke2_servers` and `rke2_agents`.
 
 ### Run the Playbook
 
-Deploy RKE2 to all nodes:
+Deploy RKE2 to all nodes with the broken conditionals flag to work around a playbook bug:
 
 ```bash
-ansible-playbook site.yml -i inventory/my-cluster/hosts.yml
+cd ~/vscode/rke2-ansible
+ANSIBLE_ALLOW_BROKEN_CONDITIONALS=True ansible-playbook site.yml -i inventory/my-cluster/hosts.yml
 ```
 
 **Expected runtime:** 10-20 minutes depending on network speed and node performance.
@@ -178,12 +179,61 @@ ansible-playbook site.yml -i inventory/my-cluster/hosts.yml
 The playbook will:
 1. Install RKE2 on all control plane nodes (with high availability)
 2. Install RKE2 on all worker nodes
-3. Configure SELinux support
-4. Set up the cluster
+3. Configure the cluster with the pinned version
+
+**Note:** We use `ANSIBLE_ALLOW_BROKEN_CONDITIONALS=True` to work around a CIS hardening conditional bug in the rke2-ansible playbook. This allows the playbook to continue despite the broken conditional and doesn't affect basic cluster functionality.
 
 ### Monitor Progress
 
 Watch for output indicating successful installation on each node. If errors occur, the playbook will stop and display the error message.
+
+### Configure Worker Nodes with Cluster Token
+
+After the initial playbook run completes, the control planes will be running but the worker nodes will need the cluster token to join. Retrieve the token from the first control plane:
+
+```bash
+ssh rke2-cp1 "sudo cat /var/lib/rancher/rke2/server/node-token"
+```
+
+Save this token - you'll need it. Now update your `inventory/my-cluster/hosts.yml` to include the server URL and token for the agents:
+
+```bash
+cat > ~/vscode/rke2-ansible/inventory/my-cluster/hosts.yml << 'EOF'
+---
+rke2_cluster:
+  children:
+    rke2_servers:
+      hosts:
+        rke2-cp1:
+          ansible_host: 10.2.1.186
+        rke2-cp2:
+          ansible_host: 10.2.1.187
+        rke2-cp3:
+          ansible_host: 10.2.1.188
+    rke2_agents:
+      hosts:
+        rke2-wk1:
+          ansible_host: 10.2.1.189
+          group_rke2_config:
+            server: https://10.2.1.186:6443
+            token: <YOUR_TOKEN_HERE>
+        rke2-wk2:
+          ansible_host: 10.2.1.190
+          group_rke2_config:
+            server: https://10.2.1.186:6443
+            token: <YOUR_TOKEN_HERE>
+EOF
+```
+
+Replace `<YOUR_TOKEN_HERE>` with the actual token from the previous step.
+
+Now run the playbook again to configure the worker nodes:
+
+```bash
+ANSIBLE_ALLOW_BROKEN_CONDITIONALS=True ansible-playbook site.yml -i inventory/my-cluster/hosts.yml
+```
+
+This second run will configure the worker nodes with the proper server and token, allowing them to join the cluster.
 
 ## Post-Deployment
 
@@ -241,38 +291,95 @@ kubectl cluster-info
 
 ## Troubleshooting
 
-### SSH Connection Issues
+### Known Issues with rke2-ansible
 
-If you get "Permission denied" errors:
-1. Verify SSH key has correct permissions: `chmod 600 ~/.ssh/id_proxmox`
-2. Test SSH manually: `ssh rke2-cp1 "whoami"`
-3. Verify the user exists on the node (should be `cloud-user` for cloud images)
+The rke2-ansible playbook has a few issues that can be worked around. If you encounter problems, you can apply the following fixes:
 
-### Ansible Connection Issues
+#### Issue 1: CIS Hardening Conditional Error
 
-If Ansible can't connect:
-1. Run with verbose output: `ansible-playbook site.yml -i inventory/my-cluster/hosts.yml -vv`
-2. Check your `hosts.yml` has correct IPs for `ansible_host`
-3. Verify sudoers configuration: `ssh rke2-cp1 "sudo -l"`
+**Error:** `Conditional result (False) was derived from value of type 'NoneType'`
 
-### RKE2 Installation Issues
+**Cause:** The CIS hardening task has a broken conditional that fails when `cluster_rke2_config` is an empty dict.
 
-If RKE2 fails to install:
-1. Check that nodes have internet access (required to download RKE2)
-2. Verify disk space: `ssh rke2-cp1 "df -h"`
-3. Check Rocky Linux version: `ssh rke2-cp1 "cat /etc/os-release"`
+**Fix:** Use the `ANSIBLE_ALLOW_BROKEN_CONDITIONALS=True` flag when running the playbook (which we do in our guide).
 
-### SELinux Issues
+#### Issue 2: Other Nodes Connection Timeout
 
-If you encounter SELinux denials, you can temporarily disable it for troubleshooting:
+**Error:** `Timeout when waiting for rke2-cp1:6443`
+
+**Cause:** The `other_nodes.yml` task tries to wait for the API server by hostname instead of IP, and the order of tasks causes configuration issues.
+
+**Fix:** Apply this patch to `roles/rke2/tasks/other_nodes.yml`:
+
 ```bash
-ssh rke2-cp1 "sudo setenforce 0"
+cat > ~/vscode/rke2-ansible/roles/rke2/tasks/other_nodes.yml << 'EOF'
+---
+- name: Generate config.yml on other nodes
+  ansible.builtin.include_tasks: config.yml
+- name: Flush_handlers
+  ansible.builtin.meta: flush_handlers
+- name: Ensure rke2 is running
+  ansible.builtin.service:
+    state: started
+    enabled: true
+    name: "{{ service_name }}"
+- name: Wait for remote k8s apiserver
+  ansible.builtin.wait_for:
+    host: "{{ rke2_kubernetes_api_server_host }}"
+    port: "6443"
+    state: present
+    timeout: "600"
+  changed_when: false
+EOF
 ```
 
-Then restart RKE2:
+#### Issue 3: Agent Token Not Configured
+
+**Error:** `Error: --token is required` on worker nodes
+
+**Cause:** The playbook doesn't properly pass server and token to agent nodes.
+
+**Fix:** Explicitly set the server and token in the `hosts.yml` at the agent host level (which we do in our guide).
+
+#### Issue 4: API Server Hostname vs IP Address
+
+**Error:** Agents can't connect to control plane by hostname
+
+**Cause:** The `save_generated_token.yml` task uses the node hostname instead of its IP address.
+
+**Fix:** Apply this patch to `roles/rke2/tasks/save_generated_token.yml`:
+
 ```bash
-ssh rke2-cp1 "sudo systemctl restart rke2-server"
+python3 << 'EOF'
+with open('roles/rke2/tasks/save_generated_token.yml', 'r') as f:
+    content = f.read()
+old_line = 'rke2_kubernetes_api_server_host: "{{ token_source_node }}"'
+new_line = 'rke2_kubernetes_api_server_host: "{{ hostvars[token_source_node]["ansible_host"] | default(token_source_node) }}"'
+if old_line in content:
+    content = content.replace(old_line, new_line)
+    with open('roles/rke2/tasks/save_generated_token.yml', 'w') as f:
+        f.write(content)
+    print("Applied fix: use IP address for server URL")
+EOF
 ```
+
+### SSL Handshake Timeout
+
+**Error:** `The handshake operation timed out` when fetching RKE2 version
+
+**Cause:** One or more nodes can't reach update.rke2.io to fetch the latest version.
+
+**Fix:** Pin a specific RKE2 version in `group_vars/all.yml` (which we do in our guide):
+
+```yaml
+rke2_install_version: v1.34.3+rke2r3
+```
+
+This avoids the internet lookup entirely.
+
+### Version Mismatch Between Nodes
+
+If you get version mismatch errors between control planes and agents, ensure all nodes are using the same pinned version in `group_vars/all.yml`.
 
 ## Advanced Configuration
 

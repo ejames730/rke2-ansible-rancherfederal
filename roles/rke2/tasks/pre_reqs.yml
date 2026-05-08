@@ -10,16 +10,20 @@
   when:
     - ansible_facts.services["firewalld.service"] is defined
     - ansible_facts.services["firewalld.service"].status != "not-found"
+    - not rke2_ignore_firewalld
   notify: "Restart {{ service_name }}"
+  tags: ["setup-os"]
 
 - name: Include task file network_manager_fix.yaml
   ansible.builtin.include_tasks: network_manager_fix.yaml
+  tags: ["setup-os"]
 
 - name: Add server iptables rules
   ansible.builtin.include_tasks: iptables_rules.yml
   when:
     # - ansible_facts.services["iptables.service"] is defined
     - rke2_add_iptables_rules | bool
+  tags: ["setup-os"]
 
 - name: Add fapolicyd rules
   ansible.builtin.copy:
@@ -33,8 +37,9 @@
     - ansible_facts.services["fapolicyd.service"].state == "running"
   vars:
     fapolicyd_rules: |
-      allow perm=any all : dir=/var/lib/rancher/
+      allow perm=any all : dir="{{ rke2_data_dir | dirname }}"
       allow perm=any all : dir=/opt/cni/
       allow perm=any all : dir=/run/k3s/
       allow perm=any all : dir=/var/lib/kubelet/
   notify: Restart fapolicyd
+  tags: ["setup-os"]

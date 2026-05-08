@@ -22,16 +22,18 @@
   when:
     - not rke2_reboot
     - ("rke2_servers" in group_names)
+    - ansible_facts.services["rke2-server.service"] is defined
 
 - name: Restart rke2-agent
   ansible.builtin.service:
     state: restarted
     enabled: true
     name: rke2-agent
-  throttle: 1
+  throttle: "{{ rke2_agent_service_restart_throttle }}"
   when:
     - not rke2_reboot
     - ("rke2_agents" in group_names)
+    - ansible_facts.services["rke2-agent.service"] is defined
 
 - name: Reload NetworkManager
   ansible.builtin.systemd:
